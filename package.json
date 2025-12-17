@@ -1,0 +1,18 @@
+{
+  "name": "righty",
+  "version": "1.0.0",
+  "description": "content marketing article writing agent",
+  "license": "ISC",
+  "author": "Tommy, Ubongabasi",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@types/node": "^25.0.3",
+    "ollama": "^0.6.3",
+    "typescript": "^5.9.3",
+    "zod": "^4.2.1"
+  }
+}
