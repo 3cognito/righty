@@ -4,21 +4,32 @@ import type { LLMService } from "../types/llm.js";
 import { readTextFile } from "../utils/file.js";
 import { sleep } from "../utils/time.js";
 
-export class OutlineGenerator {
+export class ResearchPlanner {
   private llmService: LLMService;
   private promptTemplatePath: string;
   private maxRetries: number;
 
   constructor(llmService: LLMService) {
     this.llmService = llmService;
-    this.promptTemplatePath = PromptPaths.OUTLINE_PROMPT;
+    this.promptTemplatePath = PromptPaths.RESEARCH_PLANNER_PROMPT;
     this.maxRetries = 3;
   }
 
-  async generate(input: ArticleInput): Promise<string> {
+  async generate(input: ArticleInput): Promise<string[]> {
     const prompt = this.buildPrompt(input);
 
-    return await this.generateWithRetry(prompt);
+    const rawOutput = await this.generateWithRetry(prompt);
+
+    const queries = this.parseQueries(rawOutput);
+
+    return queries;
+  }
+
+  private parseQueries(rawOutput: string): string[] {
+    return rawOutput
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#"));
   }
 
   private buildPrompt(input: ArticleInput): string {
@@ -56,7 +67,7 @@ export class OutlineGenerator {
     }
 
     throw new Error(
-      `Failed to generate outline after ${this.maxRetries} attempts. Last error: ${lastError?.message}`
+      `Failed to generate research queries after ${this.maxRetries} attempts. Last error: ${lastError?.message}`
     );
   }
 }
