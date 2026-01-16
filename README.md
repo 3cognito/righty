@@ -41,11 +41,11 @@ Executes the planned queries using the search API and summarizes findings with t
 
 Creates the initial article draft using Claude or another frontier model, using the research findings and guidelines.
 
-### 5. Claim Verification 
+### 5. Claim Verification (Local LLM + Programmatic checks)
 
 Extracts claims from the draft and validates them against the research summary. Claims without supporting evidence are either flagged for user review or trigger additional searches to verify them. This step will also carry out some programmatic checks and aggregate findings.
 
-### 6. Internal Linking
+### 6. Internal Linking (Local LLM)
 
 Fetches available internal links from the client repository and automatically applies relevant internal links to the draft, with options for user review and suggestions.
 
