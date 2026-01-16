@@ -81,4 +81,4 @@ Will add setup guidelines soon alongside sample data
 
 ---
 
-_This is in active development. Check back for updates on implementation status and additional features._
+_This is in active development. Check back for updates on implementation status and additional features, submit a PR if you can help, Thank you._
