@@ -1,195 +1,167 @@
-import { ResearchAgent } from "../agents/research-agent.js";
 import { ResearchPlanner } from "../agents/research_planner.js";
 import type { ArticleGenerationContext } from "./context-manager.js";
-import { STATES } from "./state.js";
+import { WorkflowStage, StageStatus, WorkflowState } from "./state.js";
 
 export interface PipelineConfig {
-  skipResearch?: boolean;
-  maxRetries?: number;
+  maxRetriesPerStage?: number;
+  skipApprovals?: boolean;
 }
 
-interface PipelineStage {
-  name: string;
+interface StageExecutor {
+  stage: WorkflowStage;
   execute: (ctx: ArticleGenerationContext) => Promise<void>;
-  shouldExecute?: (ctx: ArticleGenerationContext) => boolean;
-  onError?: (ctx: ArticleGenerationContext, error: Error) => Promise<void>;
 }
 
 export class ArticleGenerationPipeline {
-  private stages: PipelineStage[];
+  private executors: Map<WorkflowStage, StageExecutor>;
 
   constructor(
-    private researchPlanner: ResearchPlanner,
-    private researchAgent: ResearchAgent,
+    private agents: {
+      researchPlanner: ResearchPlanner;
+    },
     private config: PipelineConfig = {}
   ) {
-    this.stages = [
-      {
-        name: "research_query_generation",
-        execute: (ctx) => this.executeResearchQueryGeneration(ctx),
-        shouldExecute: () => !this.config.skipResearch,
-      },
-      {
-        name: "research_execution",
-        execute: (ctx) => this.executeResearch(ctx),
-        shouldExecute: (ctx) =>
-          !this.config.skipResearch &&
-          ctx.getResearchQueries() !== undefined &&
-          ctx.getResearchQueries()!.length > 0,
-      },
-    ];
+    this.executors = new Map([
+      [WorkflowStage.OUTLINE_GENERATION, this.createOutlineExecutor()],
+      [WorkflowStage.RESEARCH_QUERY_GENERATION, this.createResearchQueryExecutor()],
+    ]);
   }
 
-  async execute(
-    ctx: ArticleGenerationContext
-  ): Promise<ArticleGenerationContext> {
-    console.log(`\n${"=".repeat(60)}`);
+  async execute(ctx: ArticleGenerationContext): Promise<ArticleGenerationContext> {
     console.log(`Starting pipeline for context: ${ctx.getId()}`);
-    console.log(`${"=".repeat(60)}\n`);
 
     try {
-      for (const stage of this.stages) {
-        if (stage.shouldExecute && !stage.shouldExecute(ctx)) {
-          console.log(`Skipping stage: ${stage.name}`);
-          continue;
+      while (ctx.getState().stage !== WorkflowStage.COMPLETED) {
+        const currentStage = ctx.getCurrentStage();
+
+        await this.executeStage(ctx, currentStage);
+
+        if (!this.config.skipApprovals && ctx.getState().status === StageStatus.AWAITING_APPROVAL) {
+          console.log(`Pausing: ${currentStage} awaiting approval`);
+          break;
         }
 
-        console.log(`\n>> Executing stage: ${stage.name}`);
+        if (ctx.getState().isFailed()) {
+          console.log(`Pipeline stopped: ${currentStage} failed`);
+          break;
+        }
 
-        try {
-          await stage.execute(ctx);
-
-          if (ctx.hasCurrentStageFailed()) {
-            console.log(`Stage failed: ${stage.name}`);
-
-            if (stage.onError) {
-              await stage.onError(ctx, new Error(`Stage ${stage.name} failed`));
-            }
-
-            break;
-          }
-
-          console.log(`<< Stage completed: ${stage.name}`);
-        } catch (error) {
-          console.error(`Stage error: ${stage.name}`, error);
-
-          if (stage.onError) {
-            await stage.onError(ctx, error as Error);
-          }
-
-          throw error;
+        const nextState = ctx.getState().advance();
+        if (nextState) {
+          ctx.transitionTo(nextState, `Advancing to ${nextState.stage}`);
+        } else {
+          ctx.transitionTo(
+            new WorkflowState(WorkflowStage.COMPLETED, StageStatus.COMPLETED),
+            "Workflow completed"
+          );
         }
       }
 
-      if (
-        ctx.getState().stage === "research_execution" &&
-        ctx.isCurrentStageComplete()
-      ) {
-        ctx.transitionTo(
-          STATES.RESEARCH_COMPLETED,
-          "Research pipeline completed successfully"
-        );
-      }
-
-      console.log(`\n${"=".repeat(60)}`);
       console.log(`Pipeline finished`);
       console.log(ctx.getSummary());
-      console.log(`${"=".repeat(60)}\n`);
 
       return ctx;
     } catch (error) {
-      console.error("\nPipeline failed:", error);
-
+      console.error("Pipeline failed:", error);
       this.saveContextOnError(ctx);
-
       throw error;
     }
   }
 
-  private async executeResearchQueryGeneration(
-    ctx: ArticleGenerationContext
-  ): Promise<void> {
-    ctx.transitionTo(
-      STATES.RESEARCH_QUERY_GENERATING,
-      "Starting research query generation"
-    );
+  async resume(ctx: ArticleGenerationContext): Promise<ArticleGenerationContext> {
+    console.log(`Resuming pipeline from ${ctx.getCurrentStage()}`);
+    return this.execute(ctx);
+  }
 
-    const startTime = ctx.startStage("researchQueryGeneration");
+  private async executeStage(ctx: ArticleGenerationContext, stage: WorkflowStage): Promise<void> {
+    const executor = this.executors.get(stage);
+    if (!executor) {
+      throw new Error(`No executor found for stage: ${stage}`);
+    }
+
+    const currentState = ctx.getState();
+    console.log(`\n>> Executing: ${currentState.getDescription()}`);
+
+    ctx.startStage(stage);
 
     try {
-      const queries = await this.researchPlanner.generate(ctx.getInput());
+      await executor.execute(ctx);
 
-      ctx.setResearchQueries(queries);
+      ctx.completeStage();
 
-      ctx.completeStage("researchQueryGeneration", startTime);
+      const completionStatus = currentState.requiresApproval()
+        ? StageStatus.AWAITING_APPROVAL
+        : StageStatus.COMPLETED;
 
-      console.log(`Generated ${queries.length} research queries:`);
-      queries.forEach((q, i) => console.log(`  ${i + 1}. ${q}`));
+      const newState = new WorkflowState(stage, completionStatus);
+      ctx.transitionTo(
+        newState,
+        currentState.requiresApproval()
+          ? `${currentState.getDescription()} completed, awaiting approval`
+          : `${currentState.getDescription()} completed`
+      );
 
-      if (ctx.isResearchQueryApprovalRequired()) {
-        ctx.transitionTo(
-          STATES.RESEARCH_QUERY_AWAITING_APPROVAL,
-          `Generated ${queries.length} research queries, awaiting approval`
-        );
+      console.log(`<< Completed: ${newState.getDescription()}`);
+    } catch (error) {
+      console.error(`Stage error: ${currentState.getDescription()}`, error);
+
+      ctx.failStage(error as Error);
+
+      const failedState = new WorkflowState(stage, StageStatus.FAILED);
+      ctx.transitionTo(
+        failedState,
+        `${currentState.getDescription()} failed: ${(error as Error).message}`
+      );
+
+      const execution = ctx.getStageExecutionMetrics(stage);
+      const maxRetries = this.config.maxRetriesPerStage ?? 0;
+
+      if (execution && execution.retryCount < maxRetries) {
+        console.log(`Retrying stage (attempt ${execution.retryCount + 1}/${maxRetries})`);
+
+        const retryState = new WorkflowState(stage, StageStatus.IN_PROGRESS);
+        ctx.transitionTo(retryState, `Retrying ${currentState.getDescription()}`);
+
+        await this.executeStage(ctx, stage);
       } else {
-        ctx.transitionTo(
-          STATES.RESEARCH_QUERY_GENERATED,
-          `Generated ${queries.length} research queries`
-        );
+        throw error;
       }
-    } catch (error) {
-      ctx.failStage("researchQueryGeneration", startTime, error as Error);
-      ctx.transitionTo(
-        STATES.RESEARCH_QUERY_FAILED,
-        "Research query generation failed"
-      );
-      throw error;
     }
   }
 
-  private async executeResearch(ctx: ArticleGenerationContext): Promise<void> {
-    const queries = ctx.getResearchQueries();
-    if (!queries || queries.length === 0) {
-      throw new Error("No research queries available");
-    }
+  private createOutlineExecutor(): StageExecutor {
+    return {
+      stage: WorkflowStage.OUTLINE_GENERATION,
+      execute: async (ctx) => {
+        const outline = ``;
+        ctx.setOutline(outline);
+        console.log(`Generated outline (${outline.length} chars)`);
+      },
+    };
+  }
 
-    ctx.transitionTo(
-      STATES.RESEARCH_STARTED,
-      `Starting research for ${queries.length} queries`
-    );
+  private createResearchQueryExecutor(): StageExecutor {
+    return {
+      stage: WorkflowStage.RESEARCH_QUERY_GENERATION,
+      execute: async (ctx) => {
+        const outline = ctx.getOutline();
+        if (!outline) {
+          throw new Error("No outline available for research query generation");
+        }
 
-    const startTime = ctx.startStage("researchExecution");
+        const queries = await this.agents.researchPlanner.generate(ctx.getInput());
+        ctx.setResearchQueries(queries);
 
-    try {
-      const results = await this.researchAgent.execute(queries);
-
-      ctx.setResearchResults(results);
-      ctx.completeStage("researchExecution", startTime);
-
-      console.log(`\nResearch results (${results.length} total):`);
-      results.slice(0, 5).forEach((r, i) => {
-        console.log(`  ${i + 1}. ${r.url}`);
-      });
-      if (results.length > 5) {
-        console.log(`  ... and ${results.length - 5} more`);
-      }
-
-      ctx.transitionTo(
-        STATES.RESEARCH_COMPLETED,
-        `Research completed with ${results.length} results`
-      );
-    } catch (error) {
-      ctx.failStage("researchExecution", startTime, error as Error);
-      ctx.transitionTo(STATES.RESEARCH_FAILED, "Research execution failed");
-      throw error;
-    }
+        console.log(`Generated ${queries.length} research queries:`);
+      },
+    };
   }
 
   private saveContextOnError(ctx: ArticleGenerationContext): void {
     try {
       const filename = `error-context-${ctx.getId()}.json`;
-      console.log(`Error context ID: ${ctx.getId()}`);
-      console.log(`To debug, check context state: ${JSON.stringify(ctx.toJSON(), null, 2)}`);
+      console.log(`Error context saved: ${filename}`);
+      console.log(`Context state:\n${JSON.stringify(ctx.toJSON(), null, 2)}`);
     } catch (error) {
       console.error("Failed to save error context:", error);
     }

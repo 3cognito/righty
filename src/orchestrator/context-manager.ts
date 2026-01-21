@@ -1,290 +1,355 @@
-import type { ArticleInput } from "../schemas/article_input.schema.js";
-import {
-  getStateDescription,
-  isStageComplete,
-  isStageFailed,
-  STATES,
-  type WorkflowStage,
-  type WorkflowState,
-} from "./state.js";
+import type { IArticle } from "../types/article_data.js";
+import { StageStatus, WorkflowStage, WorkflowState } from "./state.js";
 
 export interface ResearchResult {
-  url: string;
-  text: string;
+  query?: string;
+  results: {
+    url: string;
+    text: string;
+  }[];
 }
 
-interface StageResult {
-  success: boolean;
-  timestamp: string;
-  durationMs: number;
-  error?: string;
+export interface ResearchResultSummary {
+  query?: string;
+  summary: {
+    url: string;
+    text: string;
+  }[];
+}
+
+export interface StageOutputs {
+  outline?: {
+    content: string;
+    approvedAt?: Date;
+    rejectionReason?: string;
+  };
+  researchQueries?: {
+    queries: string[];
+    approvedAt?: Date;
+    rejectionReason?: string;
+  };
+  researchResults?: {
+    results: ResearchResult[];
+  };
+  researchSummary?: {
+    summaries: ResearchResultSummary[];
+  };
+  draft?: {
+    content: string;
+    approvedAt?: Date;
+    rejectionReason?: string;
+  };
+  claimVerification?: {
+    content: string;
+  };
+  internalLinks?: {
+    content: string;
+  };
+}
+
+export interface StageExecutionMetric {
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
   tokensUsed?: number;
+  error?: {
+    message: string;
+    stack?: string;
+  };
+  retryCount: number;
 }
 
 export interface ArticleGenerationContextData {
   id: string;
+  createdAt: string;
+  updatedAt: string;
+  input: IArticle;
   state: WorkflowState;
-  input: ArticleInput;
-
-  researchQueries?: string[];
-  researchResults?: ResearchResult[];
-  outline?: string;
-  draft?: string;
-
-  stageResults: {
-    researchQueryGeneration?: StageResult;
-    researchExecution?: StageResult;
-    outlineGeneration?: StageResult;
-    draftGeneration?: StageResult;
-  };
-
-  approvals: {
-    researchQueries?: Date;
-    outline?: Date;
-  };
-
-  metadata: {
-    createdAt: string;
-    updatedAt: string;
-    requiresApproval: {
-      researchQueries: boolean;
-      outline: boolean;
-    };
-  };
-
+  outputs: StageOutputs;
+  stageExecutionMetrics: Partial<Record<WorkflowStage, StageExecutionMetric>>;
   history: Array<{
     timestamp: string;
     state: WorkflowState;
     action: string;
   }>;
-
-  errors: Array<{
-    timestamp: string;
-    stage: WorkflowStage;
-    error: string;
-    stack?: string;
-  }>;
 }
 
 export class ArticleGenerationContext {
   private data: ArticleGenerationContextData;
+  private currentExecution?: { stage: WorkflowStage; startTime: number };
 
-  constructor(
-    input: ArticleInput,
-    config?: {
-      requiresApproval?: {
-        researchQueries?: boolean;
-        outline?: boolean;
-      };
-    }
-  ) {
+  constructor(input: IArticle) {
     const now = new Date().toISOString();
+    const initialState = WorkflowState.initial();
 
     this.data = {
       id: crypto.randomUUID(),
-      state: STATES.INITIALIZED,
+      createdAt: now,
+      updatedAt: now,
+      state: initialState,
       input,
-      stageResults: {},
-      approvals: {},
-      metadata: {
-        createdAt: now,
-        updatedAt: now,
-        requiresApproval: {
-          researchQueries: config?.requiresApproval?.researchQueries ?? false,
-          outline: config?.requiresApproval?.outline ?? true,
-        },
-      },
+      outputs: {},
+      stageExecutionMetrics: {},
       history: [
         {
           timestamp: now,
-          state: STATES.INITIALIZED,
-          action: "Context initialized",
+          state: initialState,
+          action: "Workflow initialized",
         },
       ],
-      errors: [],
     };
   }
 
   transitionTo(newState: WorkflowState, action: string): void {
+    if (!this.data.state.canTransitionTo(newState)) {
+      throw new Error(
+        `Invalid transition from ${this.data.state.getDescription()} to ${newState.getDescription()}`
+      );
+    }
+
     const now = new Date().toISOString();
-
     this.data.state = newState;
-    this.data.metadata.updatedAt = now;
-    this.data.history.push({
-      timestamp: now,
-      state: newState,
-      action,
-    });
+    this.data.updatedAt = now;
+    this.data.history.push({ timestamp: now, state: newState, action });
 
-    const description = getStateDescription(newState);
-    console.log(`[${this.data.id}] ${description}: ${action}`);
+    console.log(`[${this.data.id}] ${newState.getDescription()}: ${action}`);
   }
 
-  getState(): WorkflowState {
-    return this.data.state;
+  startStage(stage: WorkflowStage): void {
+    if (this.currentExecution) {
+      throw new Error(
+        `Cannot start stage ${stage}: stage ${this.currentExecution.stage} is still running`
+      );
+    }
+
+    const now = new Date().toISOString();
+    this.currentExecution = { stage, startTime: Date.now() };
+
+    this.data.stageExecutionMetrics[stage] = {
+      startedAt: now,
+      retryCount: this.data.stageExecutionMetrics[stage]?.retryCount ?? 0,
+    };
+    this.data.updatedAt = now;
+  }
+
+  completeStage(tokensUsed?: number): void {
+    if (!this.currentExecution) {
+      throw new Error("No stage is currently running");
+    }
+
+    const { stage, startTime } = this.currentExecution;
+    const now = new Date().toISOString();
+    const durationMs = Date.now() - startTime;
+
+    this.data.stageExecutionMetrics[stage] = {
+      ...this.data.stageExecutionMetrics[stage]!,
+      completedAt: now,
+      durationMs,
+      ...(tokensUsed !== undefined && { tokensUsed }),
+    };
+    this.data.updatedAt = now;
+    this.currentExecution = undefined;
+  }
+
+  failStage(error: Error): void {
+    if (!this.currentExecution) {
+      throw new Error("No stage is currently running");
+    }
+
+    const { stage, startTime } = this.currentExecution;
+    const now = new Date().toISOString();
+    const durationMs = Date.now() - startTime;
+
+    this.data.stageExecutionMetrics[stage] = {
+      ...this.data.stageExecutionMetrics[stage]!,
+      completedAt: now,
+      durationMs,
+      error: {
+        message: error.message,
+        stack: error.stack,
+      },
+    };
+    this.data.updatedAt = now;
+    this.currentExecution = undefined;
+  }
+
+  setOutline(content: string): void {
+    this.data.outputs.outline = { content };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  approveOutline(): void {
+    if (!this.data.outputs.outline) {
+      throw new Error("No outline to approve");
+    }
+    this.data.outputs.outline.approvedAt = new Date();
+    this.transitionTo(this.data.state.withStatus(StageStatus.COMPLETED), "Outline approved");
+  }
+
+  rejectOutline(reason: string): void {
+    if (!this.data.outputs.outline) {
+      throw new Error("No outline to reject");
+    }
+    this.data.outputs.outline.rejectionReason = reason;
+    this.transitionTo(
+      this.data.state.withStatus(StageStatus.REJECTED),
+      `Outline rejected: ${reason}`
+    );
+  }
+
+  getOutline(): string | undefined {
+    return this.data.outputs.outline?.content;
+  }
+
+  setResearchQueries(queries: string[]): void {
+    this.data.outputs.researchQueries = { queries };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  approveResearchQueries(): void {
+    if (!this.data.outputs.researchQueries) {
+      throw new Error("No research queries to approve");
+    }
+    this.data.outputs.researchQueries.approvedAt = new Date();
+    this.transitionTo(
+      this.data.state.withStatus(StageStatus.COMPLETED),
+      "Research queries approved"
+    );
+  }
+
+  rejectResearchQueries(reason: string): void {
+    if (!this.data.outputs.researchQueries) {
+      throw new Error("No research queries to reject");
+    }
+    this.data.outputs.researchQueries.rejectionReason = reason;
+    this.transitionTo(
+      this.data.state.withStatus(StageStatus.REJECTED),
+      `Research queries rejected: ${reason}`
+    );
+  }
+
+  getResearchQueries(): string[] | undefined {
+    return this.data.outputs.researchQueries?.queries;
+  }
+
+  setResearchResults(results: ResearchResult[]): void {
+    this.data.outputs.researchResults = { results };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  getResearchResults(): ResearchResult[] | undefined {
+    return this.data.outputs.researchResults?.results;
+  }
+
+  setResearchSummary(summaries: ResearchResultSummary[]): void {
+    this.data.outputs.researchSummary = { summaries };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  getResearchSummary(): ResearchResultSummary[] | undefined {
+    return this.data.outputs.researchSummary?.summaries;
+  }
+
+  setDraft(content: string): void {
+    this.data.outputs.draft = { content };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  approveDraft(): void {
+    if (!this.data.outputs.draft) {
+      throw new Error("No draft to approve");
+    }
+    this.data.outputs.draft.approvedAt = new Date();
+    this.transitionTo(this.data.state.withStatus(StageStatus.COMPLETED), "Draft approved");
+  }
+
+  rejectDraft(reason: string): void {
+    if (!this.data.outputs.draft) {
+      throw new Error("No draft to reject");
+    }
+    this.data.outputs.draft.rejectionReason = reason;
+    this.transitionTo(
+      this.data.state.withStatus(StageStatus.REJECTED),
+      `Draft rejected: ${reason}`
+    );
+  }
+
+  getDraft(): string | undefined {
+    return this.data.outputs.draft?.content;
+  }
+
+  setClaimVerification(content: string): void {
+    this.data.outputs.claimVerification = { content };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  getClaimVerification(): string | undefined {
+    return this.data.outputs.claimVerification?.content;
+  }
+
+  setInternalLinks(content: string): void {
+    this.data.outputs.internalLinks = { content };
+    this.data.updatedAt = new Date().toISOString();
+  }
+
+  getInternalLinks(): string | undefined {
+    return this.data.outputs.internalLinks?.content;
   }
 
   getId(): string {
     return this.data.id;
   }
 
-  isInStage(stage: string) {
-    this.data.state.stage == stage;
+  getState(): WorkflowState {
+    return this.data.state;
+  }
+
+  getCurrentStage(): WorkflowStage {
+    return this.data.state.stage;
   }
 
   isCurrentStageComplete(): boolean {
-    return isStageComplete(this.data.state);
+    return this.data.state.isComplete();
   }
 
   hasCurrentStageFailed(): boolean {
-    return isStageFailed(this.data.state);
+    return this.data.state.isFailed();
   }
 
-  setResearchQueries(queries: string[]): void {
-    this.data.researchQueries = queries;
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  setResearchResults(results: ResearchResult[]): void {
-    this.data.researchResults = results;
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  setOutline(outline: string): void {
-    this.data.outline = outline;
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  setDraft(draft: string): void {
-    this.data.draft = draft;
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  setResearchQueryApproval(): void {
-    this.data.approvals.researchQueries = new Date();
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  setOutlineApproval(): void {
-    this.data.approvals.outline = new Date();
-    this.data.metadata.updatedAt = new Date().toISOString();
-  }
-
-  isResearchQueryApprovalRequired(): boolean {
-    return this.data.metadata.requiresApproval.researchQueries;
-  }
-
-  isOutlineApprovalRequired(): boolean {
-    return this.data.metadata.requiresApproval.outline;
-  }
-
-  getInput(): ArticleInput {
+  getInput(): IArticle {
     return this.data.input;
   }
 
-  getResearchQueries(): string[] | undefined {
-    return this.data.researchQueries;
-  }
-
-  getResearchResults(): ResearchResult[] | undefined {
-    return this.data.researchResults;
-  }
-
-  getOutline(): string | undefined {
-    return this.data.outline;
-  }
-
-  startStage(
-    stage: keyof ArticleGenerationContextData["stageResults"]
-  ): number {
-    return Date.now();
-  }
-
-  completeStage(
-    stage: keyof ArticleGenerationContextData["stageResults"],
-    startTime: number,
-    tokensUsed?: number
-  ): void {
-    const now = new Date().toISOString();
-    const durationMs = Date.now() - startTime;
-
-    const result: StageResult = {
-      success: true,
-      timestamp: now,
-      durationMs,
-    };
-
-    if (tokensUsed !== undefined) {
-      result.tokensUsed = tokensUsed;
-    }
-
-    this.data.stageResults[stage] = result;
-    this.data.metadata.updatedAt = now;
-  }
-
-  failStage(
-    stage: keyof ArticleGenerationContextData["stageResults"],
-    startTime: number,
-    error: Error
-  ): void {
-    const now = new Date().toISOString();
-    const durationMs = Date.now() - startTime;
-
-    this.data.stageResults[stage] = {
-      success: false,
-      timestamp: now,
-      durationMs,
-      error: error.message,
-    };
-    this.data.metadata.updatedAt = now;
-
-    this.recordError(
-      stage.replace(/([A-Z])/g, "_$1").toLowerCase() as WorkflowStage,
-      error
-    );
-  }
-
-  recordError(stage: WorkflowStage, error: Error): void {
-    const errorEntry: {
-      timestamp: string;
-      stage: WorkflowStage;
-      error: string;
-      stack?: string;
-    } = {
-      timestamp: new Date().toISOString(),
-      stage,
-      error: error.message,
-    };
-
-    if (error.stack) {
-      errorEntry.stack = error.stack;
-    }
-
-    this.data.errors.push(errorEntry);
+  getStageExecutionMetrics(stage: WorkflowStage): StageExecutionMetric | undefined {
+    return this.data.stageExecutionMetrics[stage];
   }
 
   getSummary(): string {
-    const created = new Date(this.data.metadata.createdAt);
-    const updated = new Date(this.data.metadata.updatedAt);
+    const created = new Date(this.data.createdAt);
+    const updated = new Date(this.data.updatedAt);
     const durationMs = updated.getTime() - created.getTime();
     const durationSec = (durationMs / 1000).toFixed(2);
 
-    const stagesSummary = Object.entries(this.data.stageResults)
-      .map(([stage, result]) => {
-        const status = result.success ? "OK" : "FAILED";
-        const duration = (result.durationMs / 1000).toFixed(2);
-        return `  - ${stage}: ${status} (${duration}s)`;
+    const stagesSummary = Object.entries(this.data.stageExecutionMetrics)
+      .map(([stage, execMetric]) => {
+        const status = execMetric.error ? "FAILED" : "OK";
+        const duration = execMetric.durationMs ? (execMetric.durationMs / 1000).toFixed(2) : "N/A";
+        return `  - ${stage}: ${status} (${duration}s)${
+          execMetric.retryCount > 0 ? ` [${execMetric.retryCount} retries]` : ""
+        }`;
       })
       .join("\n");
+
+    const errorCount = Object.values(this.data.stageExecutionMetrics).filter((e) => e.error).length;
 
     return `
 Pipeline Summary:
   ID: ${this.data.id}
-  Final State: ${getStateDescription(this.data.state)}
+  Final State: ${this.data.state.getDescription()}
   Total Duration: ${durationSec}s
-  Research Queries: ${this.data.researchQueries?.length ?? 0}
-  Research Results: ${this.data.researchResults?.length ?? 0}
-  Errors: ${this.data.errors.length}
+  Research Queries: ${this.data.outputs.researchQueries?.queries.length ?? 0}
+  Research Results: ${this.data.outputs.researchResults?.results.length ?? 0}
+  Errors: ${errorCount}
 
 Stage Results:
 ${stagesSummary || "  (none)"}
@@ -292,6 +357,23 @@ ${stagesSummary || "  (none)"}
   }
 
   toJSON(): ArticleGenerationContextData {
-    return { ...this.data };
+    return {
+      ...structuredClone(this.data),
+      state: this.data.state.toJSON() as WorkflowState,
+    };
+  }
+
+  static fromJSON(data: ArticleGenerationContextData): ArticleGenerationContext {
+    const ctx = Object.create(ArticleGenerationContext.prototype);
+    ctx.data = {
+      ...data,
+      state: WorkflowState.fromJSON(data.state.toJSON()),
+      history: data.history.map((h) => ({
+        ...h,
+        state: WorkflowState.fromJSON(h.state.toJSON()),
+      })),
+    };
+    ctx.currentExecution = undefined;
+    return ctx;
   }
 }
